@@ -1,5 +1,7 @@
 # LumaScribe
 
+![LumaScribe Title](Assets/lumascribe_title.png)
+
 **Speak freely. Stay local.**
 
 LumaScribe is a Windows voice-typing app with a luminous, cyber-anime interface and custom Sachiko artwork. Press a global hotkey, speak, then press it again to type the transcription into the active window.
