@@ -15,6 +15,7 @@ Speech recognition is powered by OpenAI's Whisper through **whisper.cpp**. LumaS
 - Global recording hotkey, with real **click → press keys → Apply** binding capture.
 - Dedicated Insert by default; optional numpad 0 trigger, **off by default**.
 - Separate configurable cancel key; Escape by default.
+- Microphone selection beneath the model and CUDA controls, with a system-default option, saved preference and Refresh button.
 - Local transcription on an NVIDIA GPU using a selected CUDA-enabled whisper.cpp engine.
 - Types into the active window without submitting the message.
 - Floating microphone indicator, session transcription history and copy-all button.
@@ -39,7 +40,8 @@ This release uses GGML models for whisper.cpp, **not GGUF files, Hugging Face Tr
 2. Double-click **Open_LumaScribe.bat**. The launcher installs missing Python dependencies on the first run, then opens the app without a persistent command window.
 3. Under **Model file**, choose a local `ggml-*.bin` file. If you already have one, reuse it.
 4. The bundled **Engine/whisper-cli.exe** is selected automatically for new users. You can choose another engine if needed. Keep the engine's DLLs beside it. `WhisperDesktop.exe` is a separate application and is not a compatible CLI engine.
-5. Click the text field in the destination app. Press **Insert** to record; press it again to stop and type.
+5. Under **Microphone**, choose the input you want, or leave **System default** selected. Your choice is saved. Use **Refresh** after connecting a microphone.
+6. Click the text field in the destination app. Press **Insert** to record; press it again to stop and type.
 
 The current transcription language is fixed to English. Multilingual model files can be selected, but this app currently passes `-l en` to the engine.
 
@@ -150,6 +152,8 @@ Network access is used by the launcher to install missing dependencies and by an
 - **`python` is not recognized:** install Python with its PATH option enabled, then reopen the launcher.
 - **CUDA not confirmed / missing DLL:** use a CUDA-enabled engine archive, retain its DLLs and check your NVIDIA driver/build compatibility.
 - **Text goes into the wrong window:** focus the destination field and keep it active until transcription finishes. Do not rely on typing into elevated/admin apps from an unelevated app.
+- **Microphone unavailable:** reconnect the selected microphone and click Refresh, or choose another input/System default. A disconnected saved microphone is never silently replaced.
+- **Microphone cannot open:** check Windows microphone permissions and close apps using it. If the device rejects mono 16 kHz recording, try another driver entry for the same microphone.
 - **Numpad 0 starts recording:** turn off its optional trigger in Hotkey settings.
 - **No updates found:** the repository needs a published public stable Release and the correctly named ZIP asset.
 
