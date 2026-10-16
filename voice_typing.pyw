@@ -813,13 +813,34 @@ def _star(draw, x, y, r, fill):
     draw.polygon([(x + px * r, y + py * r) for px, py in pts], fill=fill)
 
 
-def aero_backdrop(width, height, margin, bottom, radius, card_rgb, left=None, portrait=None, card=True, box=None, portrait_at=(0, 0)):
+def aero_backdrop(width, height, margin, bottom, radius, card_rgb, left=None, portrait=None, card=True, box=None, portrait_at=(0, 0), sky=None, quick=False):
     """Pale sky, light rays, bubbles and the portrait, with a rounded glass card floating on top."""
     from PIL import Image, ImageChops, ImageDraw, ImageFilter
     import math
     import numpy as np
     w, h = max(2, int(width)), max(2, int(height))
-    u = max(1.0, margin / 22.0)
+    u = max(.1, margin / 22.0)
+
+    if sky is not None:
+        image = sky.resize((w, h), Image.Resampling.BILINEAR).convert("RGBA")
+    else:
+        image = aero_sky(w, h, margin, bottom)
+
+    # The character portrait sits on the left, behind the card.
+    if portrait is not None:
+        image.paste(portrait, portrait_at, portrait)
+    if not card:
+        return image.convert("RGB")
+
+    return aero_card(image, box if box else ((margin if left is None else left), margin, w - margin, h - bottom), radius, card_rgb, u, 1 if quick else 3)
+
+
+def aero_sky(w, h, margin, bottom):
+    """Background without the portrait or card, also reused by live resizing."""
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter
+    import math
+    import numpy as np
+    u = max(.1, margin / 22.0)
 
     # Sky gradient with a bright sun glow in the top-right corner.
     ys = np.linspace(0, 1, h)
@@ -888,18 +909,20 @@ def aero_backdrop(width, height, margin, bottom, radius, card_rgb, left=None, po
         gap *= 1.30
     image.alpha_composite(hud.resize((w, h), Image.Resampling.LANCZOS))
 
-    # The character portrait sits on the left, behind the card.
-    if portrait is not None:
-        image.paste(portrait, portrait_at, portrait)
-    if not card:
-        return image.convert("RGB")
+    return image
+
+
+def aero_card(image, box, radius, card_rgb, u, supersample=3):
+    """Draw the existing glass card at the same bounds used by the controls."""
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter
+    w, h = image.size
 
     # The frosted glass card itself: soft shadow, white halo, solid face, thin blue edge.
-    x0, y0, x1, y1 = box if box else ((margin if left is None else left), margin, w - margin, h - bottom)
+    x0, y0, x1, y1 = box
     shadow = Image.new("RGBA", (w, h))
     ImageDraw.Draw(shadow).rounded_rectangle((x0 + 2, y0 + 8, x1 - 2, y1 + 8), radius=radius, fill=(6, 60, 100, 120))
     image.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(10)))
-    s, pad = 3, 4
+    s, pad = supersample, 4
     cw, ch = x1 - x0, y1 - y0
     size = ((cw + pad * 2) * s, (ch + pad * 2) * s)
 
@@ -934,6 +957,21 @@ def aero_backdrop(width, height, margin, bottom, radius, card_rgb, left=None, po
         tx = x0 + round(60 * u) + i * round(7 * u)
         br.line((tx, y0 - off, tx, y0 - off + (round(6 * u) if i % 4 == 0 else round(3 * u))), fill=(40, 176, 240, 200), width=max(1, lw // 2))
     return image.convert("RGB")
+
+
+def resize_preview(sky, portrait, lay, width, height, margin, bottom, radius):
+    """Cheap live composition; exact layout, with the full-quality render following."""
+    from PIL import Image
+    scale = min(.5, 720 / max(width, height))
+    size = (max(2, round(width * scale)), max(2, round(height * scale)))
+    box = tuple(round(v * scale) for v in lay["box"])
+    at = (round(lay["px"] * scale), round(lay["py"] * scale))
+    if portrait is not None:
+        portrait = portrait.resize((max(2, round(lay["pw"] * scale)),
+                                    max(2, round(lay["ph"] * scale))), Image.Resampling.BILINEAR)
+    image = aero_backdrop(*size, margin * scale, bottom * scale, radius * scale,
+                          CARD_RGB, portrait=portrait, box=box, portrait_at=at, sky=sky, quick=True)
+    return image.resize((width, height), Image.Resampling.BILINEAR)
 
 
 def banner_butterflies(W):
@@ -1676,7 +1714,9 @@ def main():
     margin, bottom_gap, inset = round(22 * dpi), round(54 * dpi), round(18 * dpi)
     radius_px = round(22 * dpi)
     render_lock, render_queue = Lock(), Queue()
-    state = {"gen": 0, "job": None, "size": None, "photo": None}
+    state = {"gen": 0, "job": None, "preview_job": None, "active": False,
+             "size": None, "requested": None, "display_size": None,
+             "photo": None, "sky": None, "portrait": None, "preview": False}
 
     # Wallpaper canvas: sky, grid, portrait and the card, plus the portrait's glowing butterflies.
     backdrop = tk.Canvas(root, borderwidth=0, highlightthickness=0, background="#d3ebfa")
@@ -1687,8 +1727,9 @@ def main():
     frame.columnconfigure(0, weight=1)
     frame.rowconfigure(8, weight=1, minsize=round(180 * dpi))
 
-    def place_panel(width, height):
-        lay = compute_layout(width, height, dpi, has_portrait, portrait_ratio, content_bounds)
+    def place_panel(width, height, lay=None):
+        if lay is None:
+            lay = compute_layout(width, height, dpi, has_portrait, portrait_ratio, content_bounds)
         x0, y0, x1, y1 = lay["box"]
         frame.place(x=x0 + inset, y=y0 + inset, width=x1 - x0 - 2 * inset,
                     height=y1 - y0 - 2 * inset)
@@ -1699,15 +1740,29 @@ def main():
         lay = compute_layout(width, height, dpi, has_portrait, portrait_ratio, content_bounds)
         with render_lock:
             portrait = load_portrait(lay["ph"]) if has_portrait else None
+            sky = aero_backdrop(width, height, margin, bottom_gap, radius_px, CARD_RGB, card=False)
             image = aero_backdrop(width, height, margin, bottom_gap, radius_px, CARD_RGB, box=lay["box"],
-                                  portrait=portrait, portrait_at=(lay["px"], lay["py"]))
-            return lay, image, portrait_glow_sprites(portrait, lay)
+                                  portrait=portrait, portrait_at=(lay["px"], lay["py"]), sky=sky)
+            return lay, image, portrait_glow_sprites(portrait, lay), sky, portrait
 
-    def apply_backdrop(width, height, lay, image, flies):
-        state["size"] = (width, height)
+    def present_backdrop(width, height, lay, image):
+        # Commit the card pixels and the controls together, using exactly one layout.
         state["photo"] = ImageTk.PhotoImage(image, master=root)
         backdrop.itemconfigure(bg_item, image=state["photo"])
-        place_panel(root.winfo_width(), root.winfo_height())
+        place_panel(width, height, lay)
+        state["display_size"] = (width, height)
+
+    def apply_backdrop(width, height, lay, image, flies, sky=None, portrait=None):
+        state["size"] = (width, height)
+        state["preview"] = False
+        if sky is not None:
+            # Small reusable layers keep live previews cheap even at large window sizes.
+            state["sky"] = sky.copy()
+            state["sky"].thumbnail((720, 720))
+            state["portrait"] = portrait.copy() if portrait is not None else None
+            if state["portrait"] is not None:
+                state["portrait"].thumbnail((720, 720))
+        present_backdrop(width, height, lay, image)
         for item, _ in fly_items:
             backdrop.delete(item)
         fly_items.clear()
@@ -1715,25 +1770,46 @@ def main():
             photos = [ImageTk.PhotoImage(f, master=root) for f in frames]
             fly_items.append((backdrop.create_image(fx, fy, anchor="nw", image=photos[0]), photos))
 
+    def preview_backdrop():
+        state["preview_job"] = None
+        width, height = root.winfo_width(), root.winfo_height()
+        if (closing.is_set() or width < 200 or height < 200 or
+                (width, height) == state["display_size"]):
+            return
+        if state["sky"] is None:
+            place_panel(width, height)
+            return
+        lay = compute_layout(width, height, dpi, has_portrait, portrait_ratio, content_bounds)
+        image = resize_preview(state["sky"], state["portrait"], lay, width, height,
+                               margin, bottom_gap, radius_px)
+        for item, _ in fly_items:
+            backdrop.itemconfigure(item, state="hidden")
+        present_backdrop(width, height, lay, image)
+        state["preview"] = True
+
     def launch_render():
         state["job"] = None
         width, height = root.winfo_width(), root.winfo_height()
-        if width < 200 or height < 200 or (width, height) == state["size"]:
+        if (closing.is_set() or state["active"] or width < 200 or height < 200 or
+                ((width, height) == state["size"] == state["display_size"] and not state["preview"])):
             return
-        state["gen"] += 1
         gen = state["gen"]
+        state["active"] = True
 
         def work():
             try:
                 render_queue.put((gen, width, height, render_backdrop(width, height)))
             except Exception:
-                pass
+                render_queue.put((gen, width, height, None))
         Thread(target=work, daemon=True).start()
 
     def request_backdrop(event):
-        # Resize controls immediately; only the expensive wallpaper render is debounced.
-        if event.widget is root:
-            place_panel(event.width, event.height)
+        if event.widget is root and (event.width, event.height) != state["requested"]:
+            state["requested"] = (event.width, event.height)
+            state["gen"] += 1
+            # Coalesce a burst of size events without postponing every live frame.
+            if state["preview_job"] is None:
+                state["preview_job"] = root.after(16, preview_backdrop)
             if state["job"] is not None:
                 root.after_cancel(state["job"])
             state["job"] = root.after(140, launch_render)
@@ -1741,10 +1817,13 @@ def main():
     def collect_render():
         try:
             while True:
-                gen, width, height, (lay, image, flies) = render_queue.get_nowait()
-                if (gen == state["gen"] and not closing.is_set() and
+                gen, width, height, result = render_queue.get_nowait()
+                state["active"] = False
+                if (result is not None and gen == state["gen"] and not closing.is_set() and
                         (width, height) == (root.winfo_width(), root.winfo_height())):
-                    apply_backdrop(width, height, lay, image, flies)
+                    apply_backdrop(width, height, *result)
+                elif result is not None and state["job"] is None:
+                    launch_render()
         except Empty:
             pass
         root.after(40, collect_render)
@@ -2373,7 +2452,7 @@ def main():
             full = aero_backdrop(width, height, margin, bottom_gap, radius_px, CARD_RGB, box=lay["box"],
                                  portrait=portrait, portrait_at=at)
             # Use the same picture as the window's wallpaper so the intro hands over seamlessly.
-            apply_backdrop(width, height, lay, full, portrait_glow_sprites(portrait, lay))
+            apply_backdrop(width, height, lay, full, portrait_glow_sprites(portrait, lay), sky, portrait)
             root.update()
             if banner_job[0] is not None:
                 root.after_cancel(banner_job[0])
