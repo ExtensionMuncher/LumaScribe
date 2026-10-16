@@ -15,10 +15,10 @@ Speech recognition is powered by OpenAI's Whisper through **whisper.cpp**. LumaS
 - Global recording hotkey, with real **click → press keys → Apply** binding capture.
 - Dedicated Insert by default; optional numpad 0 trigger, **off by default**.
 - Separate configurable cancel key; Escape by default.
-- Microphone selection beneath the model and CUDA controls, with a system-default option, saved preference and Refresh button.
+- Simple microphone selection with one entry per Windows input and no driver acronyms, beneath the model and CUDA controls, with a system-default option, saved preference and Refresh button.
 - Local transcription on an NVIDIA GPU using a selected CUDA-enabled whisper.cpp engine.
 - Types into the active window without submitting the message.
-- Floating microphone indicator, session transcription history and copy-all button.
+- Floating microphone indicator, expanding session transcription history and copy-all button.
 - Tray operation: closing the window hides it; **Quit completely** exits.
 - Model loaded only for transcription. The engine process exits afterward, releasing its GPU allocations.
 - Opening animation with a rounded pearl/cyan wordmark, glass halo and expanding concentric rings; separate music/voice audio and optional startup sound.
@@ -153,7 +153,7 @@ Network access is used by the launcher to install missing dependencies and by an
 - **CUDA not confirmed / missing DLL:** use a CUDA-enabled engine archive, retain its DLLs and check your NVIDIA driver/build compatibility.
 - **Text goes into the wrong window:** focus the destination field and keep it active until transcription finishes. Do not rely on typing into elevated/admin apps from an unelevated app.
 - **Microphone unavailable:** reconnect the selected microphone and click Refresh, or choose another input/System default. A disconnected saved microphone is never silently replaced.
-- **Microphone cannot open:** check Windows microphone permissions and close apps using it. If the device rejects mono 16 kHz recording, try another driver entry for the same microphone.
+- **Microphone cannot open:** check Windows microphone permissions and close apps using it. If the device rejects mono 16 kHz recording, check the device settings or choose another microphone.
 - **Numpad 0 starts recording:** turn off its optional trigger in Hotkey settings.
 - **No updates found:** the repository needs a published public stable Release and the correctly named ZIP asset.
 

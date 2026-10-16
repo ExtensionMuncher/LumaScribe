@@ -19,7 +19,7 @@ required = ['Open_LumaScribe.bat', 'voice_typing.pyw', 'Assets/lumascribe_portra
 for name in required:
     if not (root / name).is_file():
         raise SystemExit(f'Missing release file: {name}')
-engine_files = sorted(p.relative_to(root).as_posix() for p in (root / 'Engine').rglob('*') if p.is_file())
+engine_files = sorted(p.relative_to(root).as_posix() for p in (root / 'Engine').rglob('*') if p.is_file() and not p.name.startswith('.'))
 if any('Engine/' + name not in engine_files for name in ('whisper-cli.exe', 'whisper.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll', 'ggml-cuda.dll')):
     raise SystemExit('Engine must include whisper-cli.exe, whisper.dll and its GGML DLLs.')
 required.extend(engine_files)

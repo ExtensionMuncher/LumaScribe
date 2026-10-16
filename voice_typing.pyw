@@ -19,7 +19,7 @@ SAMPLE_RATE = 16000
 HOTKEY = "insert"
 CANCEL_HOTKEY = "escape"
 APP_NAME = "LumaScribe"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 UPDATE_REPO = "ExtensionMuncher/LumaScribe"
 APP_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = APP_DIR / "Assets"
@@ -40,7 +40,7 @@ def asset_path(name):
     return ASSETS_DIR / name
 
 
-def microphone_devices(audio):
+def microphone_inventory(audio):
     """List input devices with a persistent identity independent of device indices."""
     apis = audio.query_hostapis()
     seen, inputs = {}, []
@@ -59,12 +59,45 @@ def microphone_devices(audio):
     return inputs
 
 
+def microphone_devices(audio):
+    """Expose one endpoint list instead of repeating each input for every driver."""
+    inputs = microphone_inventory(audio)
+    if not inputs:
+        return []
+    hosts = {item["id"]["hostapi"] for item in inputs}
+    # WASAPI represents Windows' normal input endpoints, with full device names.
+    preferred = next((host for hint in ("wasapi", "directsound", "mme")
+                      for host in sorted(hosts) if hint in host.lower()), None)
+    if preferred is not None:
+        inputs = [item for item in inputs if item["id"]["hostapi"] == preferred]
+    for item in inputs:
+        identity = item["id"]
+        suffix = f" ({identity['occurrence'] + 1})" if identity["occurrence"] else ""
+        item["label"] = identity["name"] + suffix
+    return inputs
+
+
+def match_microphone(devices, selection):
+    """Migrate old driver-specific choices only when the microphone is unambiguous."""
+    if selection is None:
+        return None
+    exact = [item for item in devices if item["id"] == selection]
+    if exact:
+        return exact[0]
+    name = selection["name"].casefold()
+    matches = [item for item in devices if item["id"]["name"].casefold() == name]
+    # Legacy MME names may be truncated to 31 characters.
+    if not matches and "mme" in selection["hostapi"].lower() and len(name) == 31:
+        matches = [item for item in devices if item["id"]["name"].casefold().startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def resolve_microphone(audio, selection):
     if selection is None:
-        return None  # PortAudio follows the system default input.
-    for device in microphone_devices(audio):
-        if device["id"] == selection:
-            return device["index"]
+        return None
+    device = match_microphone(microphone_devices(audio), selection)
+    if device is not None:
+        return device["index"]
     raise ValueError("Your selected microphone is unavailable. Reconnect it and click Refresh, "
                      "or choose another microphone below the CUDA engine.")
 
@@ -73,13 +106,18 @@ def microphone_stream(audio, selection, callback):
     """Validate and open exactly the selected input using the existing audio format."""
     device = resolve_microphone(audio, selection)
     try:
-        audio.check_input_settings(device=device, samplerate=SAMPLE_RATE, channels=1, dtype="float32")
+        info = audio.query_devices(device=device, kind="input")
+        host = str(audio.query_hostapis()[info["hostapi"]]["name"])
+        options = {}
+        if "wasapi" in host.lower():
+            options["extra_settings"] = audio.WasapiSettings(auto_convert=True)
+        audio.check_input_settings(device=device, samplerate=SAMPLE_RATE, channels=1, dtype="float32", **options)
         return audio.InputStream(device=device, samplerate=SAMPLE_RATE, channels=1,
-                                 dtype="float32", callback=callback)
+                                 dtype="float32", callback=callback, **options)
     except Exception as exc:
         raise ValueError(f"Cannot open this microphone: {exc}\n"
                          "Check Windows microphone permissions, close apps using the device, "
-                         "or select another driver entry for the microphone.") from exc
+                         "or choose another microphone.") from exc
 
 
 PORTRAIT_FILE = "lumascribe_portrait.png"
@@ -360,17 +398,67 @@ def download_release(asset, destination, closing):
             staging.unlink(missing_ok=True)
 
 
-def opening_sound(play=False, name=VOICE_WAV):
-    """Play a bundled sound asynchronously, or stop whatever is playing."""
-    import winsound
+_opening_audio_cache = {}
+
+
+def opening_audio_file():
+    """Keep one complete WAV alive until playback is explicitly stopped."""
+    import numpy as np
+    cached = _opening_audio_cache.get("path")
+    if cached is not None and cached.is_file():
+        return cached
+    with wave.open(str(asset_path(TUNE_WAV)), "rb") as tune, wave.open(str(asset_path(VOICE_WAV)), "rb") as voice:
+        rate = tune.getframerate()
+        if (tune.getsampwidth() != 2 or voice.getsampwidth() != 2 or
+                voice.getframerate() != rate or tune.getnchannels() not in (1, 2) or
+                voice.getnchannels() not in (1, 2)):
+            raise ValueError("Opening WAV files must be 16-bit PCM at the same sample rate.")
+        def stereo(wav):
+            samples = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").reshape(-1, wav.getnchannels())
+            return np.repeat(samples, 2, axis=1) if wav.getnchannels() == 1 else samples
+        music, speech = stereo(tune), stereo(voice)
+    # A short silent separation replaces the fragile PlaySound-to-PlaySound handoff.
+    gap = max(round(rate * .080), round(rate * 2.0) - len(music))
+    handle = tempfile.NamedTemporaryFile(prefix="lumascribe_opening_", suffix=".wav", delete=False)
+    path = Path(handle.name)
+    handle.close()  # Windows must be able to open the file independently.
     try:
-        sound = asset_path(name)
-        if play and sound.is_file():
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(2)
+            out.setsampwidth(2)
+            out.setframerate(rate)
+            out.writeframes(music.tobytes() + bytes(gap * 4) + speech.tobytes())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    _opening_audio_cache.update(path=path, voice_ms=(len(music) + gap) * 1000.0 / rate,
+                               duration_ms=(len(music) + gap + len(speech)) * 1000.0 / rate)
+    return path
+
+
+def opening_sound(play=False, name=None):
+    """Start the full opening once; report failure so the caller can retry."""
+    try:
+        import winsound
+        if play:
+            sound = asset_path(name) if name else opening_audio_file()
+            if not sound.is_file():
+                return False
             winsound.PlaySound(str(sound), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
         else:
             winsound.PlaySound(None, 0)
-    except (OSError, RuntimeError):
-        pass
+            cached = _opening_audio_cache.pop("path", None)
+            if cached is not None:
+                cached.unlink(missing_ok=True)
+            _opening_audio_cache.clear()
+        return True
+    except (ImportError, OSError, RuntimeError, ValueError, wave.Error, EOFError):
+        return False
+
+
+
+import atexit
+atexit.register(opening_sound)
 
 
 def wav_length_ms(name, default):
@@ -1284,7 +1372,8 @@ class IntroPlayer:
         n = len(rows)
         self.row_step = min(130.0, 900.0 / max(1, n))
         self.end = (self.ROWS_START + max(0, n - 1) * self.row_step + self.ROW_MS + 150) if n else self.CARD_IN[1] + 400
-        self.voice_at = max(2000.0, tune_ms)
+        self.voice_at = max(2000.0, tune_ms) + 80.0
+        self.sound_retry_at = 0.0
         self.closed, self.job, self.photo, self.sound_stage = False, None, None, 0
         self.canvas = tk.Canvas(root, highlightthickness=0, borderwidth=0, background="#dff3fd")
         self.binds = []
@@ -1329,13 +1418,13 @@ class IntroPlayer:
             return
         try:
             t = (time.perf_counter() - self.t0) * 1000
-            if self.sound_on:
-                if self.sound_stage == 0:
-                    opening_sound(True, TUNE_WAV)
+            if self.sound_on and self.sound_stage == 0 and t >= self.sound_retry_at:
+                if opening_sound(True):
                     self.sound_stage = 1
-                if self.sound_stage == 1 and t >= self.voice_at:
-                    opening_sound(True, VOICE_WAV)
-                    self.sound_stage = 2
+                    self.voice_at = t + _opening_audio_cache.get("voice_ms", self.voice_at)
+                    self.end = max(self.end, t + _opening_audio_cache.get("duration_ms", 0) + 200)
+                else:
+                    self.sound_retry_at = t + 250.0
             self._draw(t)
             if t >= self.end:
                 self.finish()
@@ -1457,7 +1546,7 @@ def capture_client(root):
 
 def build_rows(snapshot, frame):
     """Cut the window snapshot into horizontal bands, one per widget, bottom band first."""
-    kids = sorted(frame.pack_slaves(), key=lambda c: c.winfo_y())
+    kids = sorted((frame.grid_slaves() or frame.pack_slaves()), key=lambda c: c.winfo_y())
     fx0, fy0 = frame.winfo_x(), frame.winfo_y()
     fx1, fy1 = fx0 + frame.winfo_width(), fy0 + frame.winfo_height()
     spans = [(fy0 + c.winfo_y(), fy0 + c.winfo_y() + c.winfo_height()) for c in kids]
@@ -1595,6 +1684,15 @@ def main():
     bg_item = backdrop.create_image(0, 0, anchor="nw")
     fly_items = []
     frame = ttk.Frame(root)
+    frame.columnconfigure(0, weight=1)
+    frame.rowconfigure(8, weight=1, minsize=round(180 * dpi))
+
+    def place_panel(width, height):
+        lay = compute_layout(width, height, dpi, has_portrait, portrait_ratio, content_bounds)
+        x0, y0, x1, y1 = lay["box"]
+        frame.place(x=x0 + inset, y=y0 + inset, width=x1 - x0 - 2 * inset,
+                    height=y1 - y0 - 2 * inset)
+        return lay
 
     def render_backdrop(width, height):
         """The heavy picture work; safe to run away from the main thread."""
@@ -1609,8 +1707,7 @@ def main():
         state["size"] = (width, height)
         state["photo"] = ImageTk.PhotoImage(image, master=root)
         backdrop.itemconfigure(bg_item, image=state["photo"])
-        x0, y0, x1, y1 = lay["box"]
-        frame.place(x=x0 + inset, y=y0 + inset, width=x1 - x0 - 2 * inset, height=y1 - y0 - 2 * inset)
+        place_panel(root.winfo_width(), root.winfo_height())
         for item, _ in fly_items:
             backdrop.delete(item)
         fly_items.clear()
@@ -1634,8 +1731,9 @@ def main():
         Thread(target=work, daemon=True).start()
 
     def request_backdrop(event):
-        # Wait until the window stops changing, then redraw once. The old picture and the menu stay together meanwhile.
+        # Resize controls immediately; only the expensive wallpaper render is debounced.
         if event.widget is root:
+            place_panel(event.width, event.height)
             if state["job"] is not None:
                 root.after_cancel(state["job"])
             state["job"] = root.after(140, launch_render)
@@ -1644,7 +1742,8 @@ def main():
         try:
             while True:
                 gen, width, height, (lay, image, flies) = render_queue.get_nowait()
-                if gen == state["gen"] and not closing.is_set():
+                if (gen == state["gen"] and not closing.is_set() and
+                        (width, height) == (root.winfo_width(), root.winfo_height())):
                     apply_backdrop(width, height, lay, image, flies)
         except Empty:
             pass
@@ -1654,7 +1753,7 @@ def main():
 
     banner_h = round(112 * dpi)
     banner = tk.Canvas(frame, height=banner_h, highlightthickness=0, borderwidth=0, background=CARD)
-    banner.pack(fill="x", pady=(0, 12))
+    banner.grid(row=0, column=0, sticky="ew", pady=(0, 8))
     banner_photo = None
     glow_items = []
     banner_job = [None]
@@ -1719,7 +1818,7 @@ def main():
         save_settings()
 
     preferences = ttk.Frame(frame)
-    preferences.pack(fill="x", pady=(0, 6))
+    preferences.grid(row=1, column=0, sticky="ew", pady=(0, 4))
     ttk.Checkbutton(preferences, text="Play opening sound on launch", variable=startup_sound,
                     command=sound_preference).pack(side="left")
 
@@ -1849,19 +1948,19 @@ def main():
             status.set(f"Files selected. Click your text field and press {hotkey_name.get()}.")
 
     selectors = [hotkey_picker]
-    for label, variable, is_model in [("Model file (.bin)", model_path, True),
-                                      ("CUDA engine (whisper-cli.exe)", engine_path, False)]:
-        row = ttk.Frame(frame, style="Panel.TFrame", padding=(12, 8, 12, 12))
-        row.pack(fill="x", pady=5)
-        row.columnconfigure(0, weight=1)
-        ttk.Label(row, text=label, style="PanelTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        ttk.Entry(row, textvariable=variable, state="readonly").grid(row=1, column=0, sticky="ew")
+    for grid_row, (label, variable, is_model) in enumerate([( "Model file (.bin)", model_path, True),
+                                      ("CUDA engine", engine_path, False)], start=2):
+        row = ttk.Frame(frame, style="Panel.TFrame", padding=(12, 6))
+        row.grid(row=grid_row, column=0, sticky="ew", pady=3)
+        row.columnconfigure(1, weight=1)
+        ttk.Label(row, text=label, style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Entry(row, textvariable=variable, state="readonly").grid(row=0, column=1, sticky="ew")
         picker = ttk.Button(row, text="Choose file…", command=lambda v=variable, m=is_model: select_file(v, m))
-        picker.grid(row=1, column=1, padx=(10, 0))
+        picker.grid(row=0, column=2, padx=(10, 0))
         selectors.append(picker)
     # Compact microphone row below model/engine, leaving room for history.
     mic_row = ttk.Frame(frame, style="Panel.TFrame", padding=(12, 8))
-    mic_row.pack(fill="x", pady=5)
+    mic_row.grid(row=4, column=0, sticky="ew", pady=3)
     mic_row.columnconfigure(1, weight=1)
     ttk.Label(mic_row, text="Microphone", style="PanelTitle.TLabel").grid(row=0, column=0, padx=(0, 10))
     mic_name = tk.StringVar()
@@ -1870,6 +1969,7 @@ def main():
     mic_choices = []
 
     def refresh_microphones():
+        nonlocal microphone_selection
         if stream is not None or busy:
             return
         try:
@@ -1877,6 +1977,10 @@ def main():
         except Exception as exc:
             devices = []
             status.set(f"Could not list microphones: {exc}. Click Refresh to retry.")
+        matched = match_microphone(devices, microphone_selection)
+        if matched is not None and matched["id"] != microphone_selection:
+            microphone_selection = matched["id"]
+            save_settings()
         mic_choices[:] = [None] + [item["id"] for item in devices]
         labels = ["System default"] + [item["label"] for item in devices]
         if microphone_selection not in mic_choices:
@@ -1901,27 +2005,27 @@ def main():
     selectors.extend((mic_picker, mic_refresh))
     refresh_microphones()
     status_row = tk.Frame(frame, background="#dcf2fb", highlightthickness=1, highlightbackground="#a9d6e9")
-    status_row.pack(fill="x", pady=10)
+    status_row.grid(row=5, column=0, sticky="ew", pady=6)
     tk.Frame(status_row, width=5, background="#3fc5d8").pack(side="left", fill="y")
     status_label = ttk.Label(status_row, textvariable=status, style="Status.TLabel", wraplength=500)
     status_label.pack(side="left", fill="both", expand=True)
     status_label.bind("<Configure>", lambda e: status_label.configure(wraplength=max(160, e.width - 24)))
     button = ttk.Button(frame, text=f"Start recording ({hotkey_name.get()})", style="Record.TButton")
-    button.pack(fill="x")
+    button.grid(row=6, column=0, sticky="ew")
     ttk.Label(frame, text="Blue microphone: recording · Amber: transcribing\n"
               "Close this window to hide in the tray. Right-click the tray icon to Quit.",
-              justify="center", style="Hint.TLabel").pack(pady=(10, 0))
+              justify="center", style="Hint.TLabel").grid(row=7, column=0, sticky="ew", pady=(6, 0))
     history_entries = []
     # Bottom row (reserved first so it never gets squeezed out of tight windows).
     footer = ttk.Frame(frame)
-    footer.pack(side="bottom", fill="x", pady=(10, 0))
+    footer.grid(row=9, column=0, sticky="ew", pady=(6, 0))
     history_frame = ttk.Frame(frame, style="Panel.TFrame", padding=(12, 8, 12, 12))
-    history_frame.pack(fill="both", expand=True, pady=(12, 5))
+    history_frame.grid(row=8, column=0, sticky="nsew", pady=(8, 5))
     history_frame.columnconfigure(0, weight=1)
     history_frame.rowconfigure(1, weight=1)
     ttk.Label(history_frame, text="Transcription history (this session)", style="PanelTitle.TLabel").grid(
         row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-    history = tk.Text(history_frame, wrap="word", height=5, state="disabled",
+    history = tk.Text(history_frame, wrap="word", height=1, state="disabled",
                       font=("Segoe UI", 10), background="#fbfeff", foreground="#26485e",
                       relief="flat", borderwidth=0, highlightthickness=1,
                       highlightbackground="#a3d1e6", highlightcolor="#4fb4de",
@@ -2212,6 +2316,15 @@ def main():
     update_button.pack(side="right", padx=8)
     selectors.append(update_button)
 
+    # Honor the controls' measured size plus the history's reserved space.
+    # A too-small initial window must not squeeze history into a few lines.
+    root.update_idletasks()
+    required_height = frame.winfo_reqheight() + margin + bottom_gap + 2 * inset
+    minimum_height = min(screen_h - 90, max(round(800 * dpi), required_height))
+    root.minsize(min(round(min_w * dpi), screen_w - 40), minimum_height)
+    if root.winfo_height() < minimum_height:
+        root.geometry(f"{root.winfo_width()}x{minimum_height}")
+
     button.config(command=toggle)
     def recording_hook(event):
         captured = binding_capture.handle(event)
@@ -2238,7 +2351,7 @@ def main():
         def plain_opening():
             glow_t0[0] = time.perf_counter()
             restore()
-            opening_sound(startup_sound.get(), VOICE_WAV)
+            opening_sound(startup_sound.get())
 
         if not has_portrait:
             plain_opening()
