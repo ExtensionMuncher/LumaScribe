@@ -159,7 +159,7 @@ Network access is used by the launcher to install missing dependencies and by an
 
 ## Credits
 
-- Application direction and custom Sachiko artwork: **Reticent Aoi**.
+- Application direction and custom Sachiko artwork: **WannabeHikikomori**.
 - Speech recognition: [OpenAI Whisper](https://github.com/openai/whisper).
 - Local inference engine and model documentation: [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp).
 - Pre-converted model distribution: [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp).
